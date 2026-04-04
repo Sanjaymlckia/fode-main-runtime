@@ -18,7 +18,7 @@ const CONFIG = {
   DEAL_STAGE: "New To MLCKIA",
 
   DEAL_DUPLICATE_FIELD: "FormID",
-  VERSION: "r254C3c",
+  VERSION: "r254C3d",
   LOCAL_ACTIVATION_ENABLED: false,
   LOCAL_COMMIT_ENABLED: false,
   DEPLOY_VERSION_NUMBER: 254,
@@ -261,6 +261,28 @@ function doPost(e) {
         }));
 
         if (prepResult) {
+          const localTokenTrace = buildLocalTokenDerivationTrace_(prepResult);
+          const committedToken = extractCommittedTokenSnapshot_(committedSnapshot);
+
+          log_(logSheet, "TOKEN_DERIVATION_TRACE_LOCAL", JSON.stringify({
+            correlation_id: correlationId,
+            applicantId: parsed.ApplicantID,
+            local: localTokenTrace
+          }));
+
+          log_(logSheet, "TOKEN_DERIVATION_TRACE_COMMITTED", JSON.stringify({
+            correlation_id: correlationId,
+            applicantId: parsed.ApplicantID,
+            committed: committedToken
+          }));
+
+          const tokenParity = diagnoseTokenParity_(localTokenTrace, committedToken);
+          log_(logSheet, "TOKEN_PARITY_DIAG", JSON.stringify({
+            correlation_id: correlationId,
+            applicantId: parsed.ApplicantID,
+            tokenParity: tokenParity
+          }));
+
           const parity = comparePrepToCommittedRow_(prepResult, committedSnapshot);
           log_(logSheet, "PARITY_COMPARE_FINAL", JSON.stringify({
             correlation_id: correlationId,
@@ -407,7 +429,7 @@ function preparePortalSecretParity_(sheet, payload, ctx, applicantId) {
       portalTokenHash: "",
       portalTokenIssuedAt: "",
       portalSecretsPrepared: false,
-      tokenSource: "local_parity_prep",
+      tokenSource: "local_parity_prep_current_assumption",
       tokenDerivationBasis: tokenDerivationBasis,
       reason: "portal token headers absent"
     };
@@ -420,7 +442,7 @@ function preparePortalSecretParity_(sheet, payload, ctx, applicantId) {
       portalTokenHash: "",
       portalTokenIssuedAt: portalTokenIssuedAt,
       portalSecretsPrepared: false,
-      tokenSource: "local_parity_prep",
+      tokenSource: "local_parity_prep_current_assumption",
       tokenDerivationBasis: tokenDerivationBasis,
       reason: "missing applicantId or formId for token parity prep"
     };
@@ -435,7 +457,7 @@ function preparePortalSecretParity_(sheet, payload, ctx, applicantId) {
     portalTokenHash: hasPortalTokenHashHeader ? portalTokenHash : "",
     portalTokenIssuedAt: hasPortalTokenIssuedAtHeader ? portalTokenIssuedAt : "",
     portalSecretsPrepared: hasPortalTokenHashHeader && hasPortalTokenIssuedAtHeader,
-    tokenSource: "local_parity_prep",
+    tokenSource: "local_parity_prep_current_assumption",
     tokenDerivationBasis: tokenDerivationBasis,
     reason: hasPortalTokenHashHeader && hasPortalTokenIssuedAtHeader ? "" : "partial token headers present"
   };
@@ -692,6 +714,53 @@ function extractParitySnapshot_(rowMap) {
   };
 }
 
+function buildLocalTokenDerivationTrace_(prepResult) {
+  const tokenPlan = (prepResult && prepResult.tokenPlan) || {};
+  const rowPlan = (prepResult && prepResult.rowFieldsPlanned) || {};
+
+  return {
+    applicantId_local: String(prepResult && prepResult.applicantId_local || "").trim(),
+    fdFormId: String(rowPlan["FD_FormID"] || rowPlan["FormID"] || "").trim(),
+    correlation_id: String(rowPlan["correlation_id"] || "").trim(),
+    adapter_timestamp: String(rowPlan["adapter_timestamp"] || "").trim(),
+    portalTokenIssuedAt_local: String(tokenPlan.portalTokenIssuedAt || "").trim(),
+    portalTokenHash_local: String(tokenPlan.portalTokenHash || "").trim(),
+    tokenSource: String(tokenPlan.tokenSource || "").trim(),
+    tokenDerivationBasis: String(tokenPlan.tokenDerivationBasis || "").trim()
+  };
+}
+
+function extractCommittedTokenSnapshot_(committedSnapshot) {
+  committedSnapshot = committedSnapshot || {};
+  return {
+    ApplicantID: String(committedSnapshot.ApplicantID || "").trim(),
+    FD_FormID: String(committedSnapshot.FD_FormID || committedSnapshot.FormID || "").trim(),
+    correlation_id: String(committedSnapshot.correlation_id || "").trim(),
+    adapter_timestamp: String(committedSnapshot.adapter_timestamp || "").trim(),
+    portalTokenIssuedAt_committed: String(committedSnapshot.PortalTokenIssuedAt || "").trim(),
+    portalTokenHash_committed: String(committedSnapshot.PortalTokenHash || "").trim()
+  };
+}
+
+function diagnoseTokenParity_(localTrace, committedToken) {
+  localTrace = localTrace || {};
+  committedToken = committedToken || {};
+
+  return {
+    applicantIdMatch: String(localTrace.applicantId_local || "").trim() === String(committedToken.ApplicantID || "").trim(),
+    fdFormIdMatch: String(localTrace.fdFormId || "").trim() === String(committedToken.FD_FormID || "").trim(),
+    correlationIdMatch: String(localTrace.correlation_id || "").trim() === String(committedToken.correlation_id || "").trim(),
+    adapterTimestampMatch: String(localTrace.adapter_timestamp || "").trim() === String(committedToken.adapter_timestamp || "").trim(),
+    portalTokenIssuedAtMatch: String(localTrace.portalTokenIssuedAt_local || "").trim() === String(committedToken.portalTokenIssuedAt_committed || "").trim(),
+    portalTokenHashMatch: String(localTrace.portalTokenHash_local || "").trim() === String(committedToken.portalTokenHash_committed || "").trim(),
+    localIssuedAtLooksIso: /T\d{2}:\d{2}:\d{2}/.test(String(localTrace.portalTokenIssuedAt_local || "")),
+    committedIssuedAtLooksIso: /T\d{2}:\d{2}:\d{2}/.test(String(committedToken.portalTokenIssuedAt_committed || "")),
+    localIssuedAtLength: String(localTrace.portalTokenIssuedAt_local || "").length,
+    committedIssuedAtLength: String(committedToken.portalTokenIssuedAt_committed || "").length,
+    issuedAtFormatMismatch: String(localTrace.portalTokenIssuedAt_local || "").trim() !== String(committedToken.portalTokenIssuedAt_committed || "").trim(),
+    hashMismatch: String(localTrace.portalTokenHash_local || "").trim() !== String(committedToken.portalTokenHash_committed || "").trim()
+  };
+}
 function comparePrepToCommittedRow_(prepResult, committedSnapshot) {
   const rowPlan = (prepResult && prepResult.rowFieldsPlanned) || {};
   const tokenPlan = (prepResult && prepResult.tokenPlan) || {};
@@ -991,6 +1060,7 @@ function payloadSummary_(p) {
     Intake: p["Intake Year"] || ""
   });
 }
+
 
 
 
