@@ -18,7 +18,7 @@ const CONFIG = {
   DEAL_STAGE: "New To MLCKIA",
 
   DEAL_DUPLICATE_FIELD: "FormID",
-  VERSION: "r254C3b1",
+  VERSION: "r254C3c",
   LOCAL_ACTIVATION_ENABLED: false,
   LOCAL_COMMIT_ENABLED: false,
   DEPLOY_VERSION_NUMBER: 254,
@@ -247,6 +247,41 @@ function doPost(e) {
         mappedHeaderCount: prepResult.mappedHeaderCount || 0,
       }));
     }
+    try {
+      const dataSheet = mustGetSheet_(ss, CONFIG.DATA_SHEET);
+      const committedRow = readRowByApplicantId_(dataSheet, parsed.ApplicantID);
+
+      if (committedRow) {
+        const committedSnapshot = extractParitySnapshot_(committedRow.rowMap);
+        log_(logSheet, "DOWNSTREAM_ROW_SNAPSHOT", JSON.stringify({
+          correlation_id: correlationId,
+          applicantId: parsed.ApplicantID,
+          row: committedRow.row,
+          snapshot: committedSnapshot
+        }));
+
+        if (prepResult) {
+          const parity = comparePrepToCommittedRow_(prepResult, committedSnapshot);
+          log_(logSheet, "PARITY_COMPARE_FINAL", JSON.stringify({
+            correlation_id: correlationId,
+            applicantId: parsed.ApplicantID,
+            parity: parity
+          }));
+        }
+      } else {
+        log_(logSheet, "DOWNSTREAM_ROW_SNAPSHOT_MISS", JSON.stringify({
+          correlation_id: correlationId,
+          applicantId: parsed.ApplicantID
+        }));
+      }
+    } catch (err) {
+      log_(logSheet, "DOWNSTREAM_ROW_SNAPSHOT_ERROR", JSON.stringify({
+        correlation_id: correlationId,
+        applicantId: parsed ? parsed.ApplicantID : "",
+        error: err.message
+      }));
+    }
+
     log_(logSheet, "FORWARD_OK", JSON.stringify({
       correlation_id: correlationId,
       fd_form_id: fdFormId
@@ -610,6 +645,75 @@ function prepareLocalActivationLocked_(ss, payload, ctx) {
   }
 }
 
+function readRowByApplicantId_(sheet, applicantId) {
+  const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+  const idx = headers.indexOf("ApplicantID");
+  if (idx === -1) return null;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+
+  const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+
+  for (var i = values.length - 1; i >= 0; i--) {
+    const rowApplicantId = String(values[i][idx] || "").trim();
+    if (rowApplicantId === String(applicantId || "").trim()) {
+      const rowMap = {};
+      for (var j = 0; j < headers.length; j++) rowMap[headers[j]] = values[i][j];
+      return {
+        row: i + 2,
+        rowMap: rowMap
+      };
+    }
+  }
+
+  return null;
+}
+
+function extractParitySnapshot_(rowMap) {
+  rowMap = rowMap || {};
+  return {
+    ApplicantID: String(rowMap["ApplicantID"] || "").trim(),
+    FD_FormID: String(rowMap["FD_FormID"] || "").trim(),
+    FormID: String(rowMap["FormID"] || "").trim(),
+    Folder_Url: String(rowMap["Folder_Url"] || "").trim(),
+    CRM_Response: String(rowMap["CRM_Response"] || "").trim(),
+    Contact_ID: String(rowMap["Contact_ID"] || "").trim(),
+    Deal_ID: String(rowMap["Deal_ID"] || "").trim(),
+    PortalTokenHash: String(rowMap["PortalTokenHash"] || "").trim(),
+    PortalTokenIssuedAt: String(rowMap["PortalTokenIssuedAt"] || "").trim(),
+    adapter_forwarded: String(rowMap["adapter_forwarded"] || "").trim(),
+    adapter_source: String(rowMap["adapter_source"] || "").trim(),
+    correlation_id: String(rowMap["correlation_id"] || "").trim(),
+    adapter_timestamp: String(rowMap["adapter_timestamp"] || "").trim(),
+    intake_year_value: String(
+      rowMap["Intake Year"] || rowMap["Intake_Year"] || rowMap["IntakeYear"] || ""
+    ).trim()
+  };
+}
+
+function comparePrepToCommittedRow_(prepResult, committedSnapshot) {
+  const rowPlan = (prepResult && prepResult.rowFieldsPlanned) || {};
+  const tokenPlan = (prepResult && prepResult.tokenPlan) || {};
+  const committed = committedSnapshot || {};
+
+  return {
+    applicantIdMatch: String(prepResult && prepResult.applicantId_local || "").trim() === String(committed.ApplicantID || "").trim(),
+    folderUrlMatch: String(rowPlan["Folder_Url"] || "").trim() === String(committed.Folder_Url || "").trim(),
+    crmResponseMatch: String(rowPlan["CRM_Response"] || "").trim() === String(committed.CRM_Response || "").trim(),
+    contactIdMatch: String(rowPlan["Contact_ID"] || "").trim() === String(committed.Contact_ID || "").trim(),
+    dealIdMatch: String(rowPlan["Deal_ID"] || "").trim() === String(committed.Deal_ID || "").trim(),
+    adapterForwardedMatch: String(rowPlan["adapter_forwarded"] || "").trim() === String(committed.adapter_forwarded || "").trim(),
+    adapterSourceMatch: String(rowPlan["adapter_source"] || "").trim() === String(committed.adapter_source || "").trim(),
+    correlationIdMatch: String(rowPlan["correlation_id"] || "").trim() === String(committed.correlation_id || "").trim(),
+    adapterTimestampMatch: String(rowPlan["adapter_timestamp"] || "").trim() === String(committed.adapter_timestamp || "").trim(),
+    portalTokenHashMatch: String(tokenPlan.portalTokenHash || "").trim() === String(committed.PortalTokenHash || "").trim(),
+    portalTokenIssuedAtMatch: String(tokenPlan.portalTokenIssuedAt || "").trim() === String(committed.PortalTokenIssuedAt || "").trim(),
+    intakeYearMatch: String(
+      rowPlan["Intake Year"] || rowPlan["Intake_Year"] || ""
+    ).trim() === String(committed.intake_year_value || "").trim()
+  };
+}
 function simulateNextApplicantId_(sheet) {
   const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
   const idx = headers.indexOf("ApplicantID");
@@ -887,6 +991,7 @@ function payloadSummary_(p) {
     Intake: p["Intake Year"] || ""
   });
 }
+
 
 
 
