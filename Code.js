@@ -18,7 +18,7 @@ const CONFIG = {
   DEAL_STAGE: "New To MLCKIA",
 
   DEAL_DUPLICATE_FIELD: "FormID",
-  VERSION: "r254C3f",
+  VERSION: "r254C3g",
   LOCAL_ACTIVATION_ENABLED: false,
   LOCAL_COMMIT_ENABLED: false,
   DEPLOY_VERSION_NUMBER: 254,
@@ -292,6 +292,13 @@ function doPost(e) {
             committedHashRaw: committedSnapshot.PortalTokenHash
           }));
 
+          const tokenProbeSuite = runTokenProbeSuite_(committedSnapshot);
+          log_(logSheet, "TOKEN_PROBE_SUITE", JSON.stringify({
+            correlation_id: correlationId,
+            applicantId: parsed.ApplicantID,
+            suite: tokenProbeSuite
+          }));
+
           const parity = comparePrepToCommittedRow_(prepResult, committedSnapshot);
           log_(logSheet, "PARITY_COMPARE_FINAL", JSON.stringify({
             correlation_id: correlationId,
@@ -410,6 +417,35 @@ function toHex_(bytes) {
     const v = (b + 256) % 256;
     return ("0" + v.toString(16)).slice(-2);
   }).join("");
+}
+
+function sha256Hex_(s) {
+  return toHex_(Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    String(s || "")
+  ));
+}
+
+function sha256Base64_(s) {
+  return Utilities.base64Encode(
+    Utilities.computeDigest(
+      Utilities.DigestAlgorithm.SHA_256,
+      String(s || "")
+    )
+  );
+}
+
+function normalizeVariants_(v) {
+  const raw = String(v || "");
+  const trimmed = raw.trim();
+  return {
+    raw: raw,
+    trimmed: trimmed,
+    lower: trimmed.toLowerCase(),
+    upper: trimmed.toUpperCase(),
+    collapsedSpaces: trimmed.replace(/\s+/g, " "),
+    noSpaces: trimmed.replace(/\s+/g, "")
+  };
 }
 
 function buildLocalActivationState_() {
@@ -807,6 +843,116 @@ function buildPostHocTokenProof_(committedSnapshot) {
     recomputedHash: recomputed.portalTokenHash,
     digestInput: recomputed.digestInput,
     postHocHashMatch: String(recomputed.portalTokenHash || "").trim() === committedHash
+  };
+}
+
+function buildTokenProbeInputs_(committedSnapshot) {
+  committedSnapshot = committedSnapshot || {};
+
+  const applicantIdVariants = normalizeVariants_(committedSnapshot.ApplicantID || "");
+  const formIdVariants = normalizeVariants_(committedSnapshot.FD_FormID || committedSnapshot.FormID || "");
+  const correlationVariants = normalizeVariants_(committedSnapshot.correlation_id || "");
+  const adapterTimestampVariants = normalizeVariants_(committedSnapshot.adapter_timestamp || "");
+  const issuedAtVariants = normalizeVariants_(committedSnapshot.PortalTokenIssuedAt || "");
+
+  const orderings = [
+    { name: "ApplicantID|FormID|IssuedAt", fields: ["ApplicantID", "FormID", "PortalTokenIssuedAt"] },
+    { name: "FormID|ApplicantID|IssuedAt", fields: ["FormID", "ApplicantID", "PortalTokenIssuedAt"] },
+    { name: "ApplicantID|IssuedAt|FormID", fields: ["ApplicantID", "PortalTokenIssuedAt", "FormID"] },
+    { name: "FormID|IssuedAt|ApplicantID", fields: ["FormID", "PortalTokenIssuedAt", "ApplicantID"] },
+    { name: "IssuedAt|ApplicantID|FormID", fields: ["PortalTokenIssuedAt", "ApplicantID", "FormID"] },
+    { name: "IssuedAt|FormID|ApplicantID", fields: ["PortalTokenIssuedAt", "FormID", "ApplicantID"] },
+    { name: "ApplicantID|FormID|IssuedAt|Correlation", fields: ["ApplicantID", "FormID", "PortalTokenIssuedAt", "correlation_id"] },
+    { name: "ApplicantID|FormID|IssuedAt|AdapterTs", fields: ["ApplicantID", "FormID", "PortalTokenIssuedAt", "adapter_timestamp"] },
+    { name: "ApplicantID|FormID|Correlation|AdapterTs|IssuedAt", fields: ["ApplicantID", "FormID", "correlation_id", "adapter_timestamp", "PortalTokenIssuedAt"] },
+    { name: "ApplicantID|FormID|AdapterTs|Correlation|IssuedAt", fields: ["ApplicantID", "FormID", "adapter_timestamp", "correlation_id", "PortalTokenIssuedAt"] }
+  ];
+
+  const delimiters = [
+    { name: "pipe", value: "|" },
+    { name: "colon", value: ":" },
+    { name: "comma", value: "," },
+    { name: "semicolon", value: ";" },
+    { name: "none", value: "" }
+  ];
+
+  const variantsByField = {
+    ApplicantID: applicantIdVariants,
+    FormID: formIdVariants,
+    correlation_id: correlationVariants,
+    adapter_timestamp: adapterTimestampVariants,
+    PortalTokenIssuedAt: issuedAtVariants
+  };
+
+  const normalizationKeys = ["raw", "trimmed", "lower", "upper", "collapsedSpaces", "noSpaces"];
+  const probes = [];
+
+  orderings.forEach(function(ordering) {
+    delimiters.forEach(function(delimiter) {
+      normalizationKeys.forEach(function(normKey) {
+        const parts = ordering.fields.map(function(fieldName) {
+          return String((variantsByField[fieldName] && variantsByField[fieldName][normKey]) || "");
+        });
+        probes.push({
+          descriptor: ordering.name + "|" + delimiter.name + "|" + normKey,
+          ordering: ordering.name,
+          delimiter: delimiter.name,
+          normalization: normKey,
+          input: parts.join(delimiter.value)
+        });
+      });
+    });
+  });
+
+  return probes;
+}
+
+function runTokenProbeSuite_(committedSnapshot) {
+  committedSnapshot = committedSnapshot || {};
+  const committedHash = String(committedSnapshot.PortalTokenHash || "").trim();
+  const probes = buildTokenProbeInputs_(committedSnapshot);
+  const matchesFound = [];
+  const testedDescriptors = [];
+  let anyHexMatch = false;
+  let anyBase64Match = false;
+
+  probes.forEach(function(probe) {
+    const hex = sha256Hex_(probe.input);
+    const base64 = sha256Base64_(probe.input);
+    const hexMatch = hex === committedHash;
+    const base64Match = base64 === committedHash;
+
+    if (testedDescriptors.length < 80) {
+      testedDescriptors.push(probe.descriptor);
+    }
+
+    if (hexMatch || base64Match) {
+      if (hexMatch) anyHexMatch = true;
+      if (base64Match) anyBase64Match = true;
+      if (matchesFound.length < 20) {
+        matchesFound.push({
+          descriptor: probe.descriptor,
+          ordering: probe.ordering,
+          delimiter: probe.delimiter,
+          normalization: probe.normalization,
+          matchedEncoding: hexMatch ? "sha256_hex" : "sha256_base64"
+        });
+      }
+    }
+  });
+
+  return {
+    applicantId: String(committedSnapshot.ApplicantID || "").trim(),
+    committedHash: committedHash,
+    testedCount: probes.length,
+    matchCount: matchesFound.length,
+    anyHexMatch: anyHexMatch,
+    anyBase64Match: anyBase64Match,
+    matchesFound: matchesFound,
+    testedDescriptors: testedDescriptors,
+    conclusion: matchesFound.length > 0
+      ? "visible_inputs_recoverable"
+      : "visible_inputs_insufficient_hidden_secret_or_non_row_derivation_likely"
   };
 }
 function comparePrepToCommittedRow_(prepResult, committedSnapshot) {
