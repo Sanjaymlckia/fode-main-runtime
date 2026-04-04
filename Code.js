@@ -17,16 +17,47 @@ const CONFIG = {
   BRAND: "FODE",
   DEAL_STAGE: "New To MLCKIA",
 
-  DEAL_DUPLICATE_FIELD: "FormID"
+  DEAL_DUPLICATE_FIELD: "FormID",
+  VERSION: "r254A",
+  DEPLOY_VERSION_NUMBER: 254,
+  PROJECT: "FODE_Main_Runtime"
 };
 
+function canonicalExecBase_() {
+  const raw = String(ScriptApp.getService().getUrl() || "").trim();
+  const m = raw.match(/\/macros\/s\/([a-zA-Z0-9\-_]+)\/exec/);
+  return m
+    ? "https://script.google.com/macros/s/" + m[1] + "/exec"
+    : raw;
+}
+
 function doGet(e) {
-  return ContentService.createTextOutput(JSON.stringify({
-    ok: true,
-    project: "FODE_Main_Runtime",
-    message: "GET alive; use POST for intake",
-    timestamp: new Date().toISOString()
-  })).setMimeType(ContentService.MimeType.JSON);
+  const view = String((e && e.parameter && e.parameter.view) || "").trim().toLowerCase();
+  const base = canonicalExecBase_();
+
+  const body = view === "whoami"
+    ? {
+        ok: true,
+        project: CONFIG.PROJECT,
+        VERSION: CONFIG.VERSION,
+        DEPLOY_VERSION_NUMBER: CONFIG.DEPLOY_VERSION_NUMBER,
+        script_url: base,
+        intake_url: base,
+        timestamp: new Date().toISOString()
+      }
+    : {
+        ok: true,
+        project: CONFIG.PROJECT,
+        message: "GET alive; use POST for intake",
+        VERSION: CONFIG.VERSION,
+        DEPLOY_VERSION_NUMBER: CONFIG.DEPLOY_VERSION_NUMBER,
+        url: base,
+        timestamp: new Date().toISOString()
+      };
+
+  return ContentService
+    .createTextOutput(JSON.stringify(body))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 /******************** ENTRYPOINT ********************/
 function doPost(e) {
