@@ -18,7 +18,7 @@ const CONFIG = {
   DEAL_STAGE: "New To MLCKIA",
 
   DEAL_DUPLICATE_FIELD: "FormID",
-  VERSION: "r254C3e",
+  VERSION: "r254C3f",
   LOCAL_ACTIVATION_ENABLED: false,
   LOCAL_COMMIT_ENABLED: false,
   DEPLOY_VERSION_NUMBER: 254,
@@ -281,6 +281,15 @@ function doPost(e) {
             correlation_id: correlationId,
             applicantId: parsed.ApplicantID,
             tokenParity: tokenParity
+          }));
+
+          const postHocProof = buildPostHocTokenProof_(committedSnapshot);
+          log_(logSheet, "TOKEN_POSTHOC_PROOF", JSON.stringify({
+            correlation_id: correlationId,
+            applicantId: parsed.ApplicantID,
+            proof: postHocProof,
+            committedIssuedAtRaw: committedSnapshot.PortalTokenIssuedAt,
+            committedHashRaw: committedSnapshot.PortalTokenHash
           }));
 
           const parity = comparePrepToCommittedRow_(prepResult, committedSnapshot);
@@ -759,6 +768,45 @@ function diagnoseTokenParity_(localTrace, committedToken) {
     committedIssuedAtLength: String(committedToken.portalTokenIssuedAt_committed || "").length,
     issuedAtFormatMismatch: String(localTrace.portalTokenIssuedAt_local || "").trim() !== String(committedToken.portalTokenIssuedAt_committed || "").trim(),
     hashMismatch: String(localTrace.portalTokenHash_local || "").trim() !== String(committedToken.portalTokenHash_committed || "").trim()
+  };
+}
+
+function recomputePortalTokenHashWithIssuedAt_(applicantId, formId, issuedAt) {
+  const normIssuedAt = String(issuedAt || "").trim();
+
+  const digestInput = [
+    String(applicantId || "").trim(),
+    String(formId || "").trim(),
+    normIssuedAt
+  ].join("|");
+
+  return {
+    digestInput: digestInput,
+    portalTokenHash: toHex_(Utilities.computeDigest(
+      Utilities.DigestAlgorithm.SHA_256,
+      digestInput
+    ))
+  };
+}
+
+function buildPostHocTokenProof_(committedSnapshot) {
+  committedSnapshot = committedSnapshot || {};
+
+  const applicantId = String(committedSnapshot.ApplicantID || "").trim();
+  const formId = String(committedSnapshot.FD_FormID || committedSnapshot.FormID || "").trim();
+  const issuedAt = String(committedSnapshot.PortalTokenIssuedAt || "").trim();
+  const committedHash = String(committedSnapshot.PortalTokenHash || "").trim();
+
+  const recomputed = recomputePortalTokenHashWithIssuedAt_(applicantId, formId, issuedAt);
+
+  return {
+    applicantId: applicantId,
+    formId: formId,
+    issuedAt: issuedAt,
+    committedHash: committedHash,
+    recomputedHash: recomputed.portalTokenHash,
+    digestInput: recomputed.digestInput,
+    postHocHashMatch: String(recomputed.portalTokenHash || "").trim() === committedHash
   };
 }
 function comparePrepToCommittedRow_(prepResult, committedSnapshot) {
