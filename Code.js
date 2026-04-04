@@ -18,7 +18,7 @@ const CONFIG = {
   DEAL_STAGE: "New To MLCKIA",
 
   DEAL_DUPLICATE_FIELD: "FormID",
-  VERSION: "r254A",
+  VERSION: "r254B",
   DEPLOY_VERSION_NUMBER: 254,
   PROJECT: "FODE_Main_Runtime"
 };
@@ -66,6 +66,26 @@ function doPost(e) {
   const logSheet = mustGetSheet_(ss, CONFIG.LOG_SHEET);
 
   const payload = getPayload_(e);
+  const validation = validatePayloadShape_(payload);
+
+  if (!validation.ok) {
+    log_(logSheet, "PAYLOAD_INVALID", validation.reason);
+    return ContentService.createTextOutput(JSON.stringify({
+      status: "error",
+      reason: validation.reason
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  const sheet = mustGetSheet_(ss, CONFIG.DATA_SHEET);
+  const existingRow = findExistingByFormId_(sheet, validation.key);
+
+  if (existingRow) {
+    log_(logSheet, "IDEMPOTENT_HIT", JSON.stringify({
+      formId: validation.key,
+      row: existingRow
+    }));
+  }
+
   const fdFormId = String(payload.FD_FormID || payload.FormID || "").trim();
   const correlationId =
     String(payload.correlation_id || payload.FD_FormID || payload.FormID || "").trim() ||
@@ -182,6 +202,86 @@ function getPayload_(e) {
     try { return JSON.parse(e.postData.contents); } catch {}
   }
   return {};
+}
+
+function validatePayloadShape_(p) {
+  if (!p) return { ok: false, reason: "empty payload" };
+
+  const fd = String(p.FD_FormID || p.FormID || "").trim();
+  if (!fd) return { ok: false, reason: "missing FormID" };
+
+  if (!p.First_Name || !p.Last_Name) {
+    return { ok: false, reason: "missing name fields" };
+  }
+
+  return { ok: true, key: fd };
+}
+
+function findExistingByFormId_(sheet, formId) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+
+  const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+  const idx = headers.indexOf("FD_FormID") !== -1
+    ? headers.indexOf("FD_FormID")
+    : headers.indexOf("FormID");
+
+  if (idx === -1) return null;
+
+  const values = sheet.getRange(2, idx + 1, lastRow - 1, 1).getValues();
+
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (String(values[i][0]).trim() === formId) {
+      return i + 2;
+    }
+  }
+  return null;
+}
+
+function nextApplicantIdLocked_(sheet) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+    const idx = headers.indexOf("ApplicantID");
+    if (idx === -1) throw new Error("ApplicantID column missing");
+
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) return "FODE-" + new Date().getFullYear().toString().slice(-2) + "-000001";
+
+    const values = sheet.getRange(2, idx + 1, lastRow - 1, 1).getValues();
+
+    for (let i = values.length - 1; i >= 0; i--) {
+      const v = String(values[i][0] || "").trim();
+      const m = v.match(/^([A-Z]+-\d{2}-)(\d+)$/);
+      if (m) {
+        const next = String(parseInt(m[2], 10) + 1).padStart(m[2].length, "0");
+        return m[1] + next;
+      }
+    }
+
+    return "FODE-" + new Date().getFullYear().toString().slice(-2) + "-000001";
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function verifyApplicantWritten_(sheet, applicantId) {
+  const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+  const idx = headers.indexOf("ApplicantID");
+  if (idx === -1) return false;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return false;
+
+  const values = sheet.getRange(2, idx + 1, lastRow - 1, 1).getValues();
+
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (String(values[i][0]).trim() === applicantId) return true;
+  }
+  return false;
 }
 
 /******************** DRIVE ********************/
@@ -333,3 +433,4 @@ function payloadSummary_(p) {
     Intake: p["Intake Year"] || ""
   });
 }
+
