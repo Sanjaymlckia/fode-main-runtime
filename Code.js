@@ -18,7 +18,9 @@ const CONFIG = {
   DEAL_STAGE: "New To MLCKIA",
 
   DEAL_DUPLICATE_FIELD: "FormID",
-  VERSION: "r254C2",
+  VERSION: "r254C3a",
+  LOCAL_ACTIVATION_ENABLED: false,
+  LOCAL_COMMIT_ENABLED: false,
   DEPLOY_VERSION_NUMBER: 254,
   PROJECT: "FODE_Main_Runtime"
 };
@@ -155,45 +157,27 @@ function doPost(e) {
 
   let responseCode = 0;
   let responseText = "";
-  let shadowResult = null;
+  let prepResult = null;
 
-  const shadowSheet = mustGetSheet_(ss, CONFIG.DATA_SHEET);
+  try {
+    prepResult = prepareLocalActivationLocked_(ss, forwarded, {
+      correlationId,
+      folder,
+      folderUrl,
+      crmResponse,
+      contactId,
+      dealId,
+      adapterTimestamp
+    });
 
-    try {
-      const sim = simulateNextApplicantId_(shadowSheet);
-      const prereq = buildShadowPrereqPlan_(shadowSheet, folderUrl);
-      const rowPlan = buildShadowRowPlan_(forwarded, {
-        correlationId,
-        folderUrl,
-        crmResponse,
-        contactId,
-        dealId,
-        adapterTimestamp
-      });
+    log_(logSheet, "LOCAL_ACTIVATION_PREP", JSON.stringify(prepResult));
+  } catch (err) {
+    log_(logSheet, "LOCAL_ACTIVATION_PREP_ERROR", JSON.stringify({
+      correlation_id: correlationId,
+      error: err.message
+    }));
+  }
 
-      shadowResult = {
-        correlation_id: correlationId,
-        applicantId_local: sim.applicantId,
-        applicantIdStats: {
-          validCount: sim.validCount,
-          maxSuffix: sim.maxSuffix,
-          skippedBlankCount: sim.skippedBlankCount,
-          skippedMalformedCount: sim.skippedMalformedCount
-        },
-        incomingFolderUrl: prereq.incomingFolderUrl,
-        folderMode_local: prereq.folderMode_local,
-        tokenFieldsPlanned: prereq.tokenFieldsPlanned,
-        rowFieldsPlanned: rowPlan,
-        verificationChecksPlanned: prereq.verificationChecksPlanned
-      };
-
-      log_(logSheet, "SHADOW_ACTIVATION_RESULT", JSON.stringify(shadowResult));
-    } catch (err) {
-      log_(logSheet, "SHADOW_ACTIVATION_ERROR", JSON.stringify({
-        correlation_id: correlationId,
-        error: err.message
-      }));
-    }
 
   try {
     log_(logSheet, "FORWARD_PAYLOAD_TRACE", JSON.stringify({
@@ -246,13 +230,17 @@ function doPost(e) {
       fd_form_id: fdFormId,
       applicantId: parsed ? parsed.ApplicantID : ""
     }));
-    if (shadowResult && parsed && parsed.ApplicantID) {
-      log_(logSheet, "PARITY_COMPARE", JSON.stringify({
+    if (prepResult && parsed && parsed.ApplicantID) {
+      log_(logSheet, "PARITY_COMPARE_STRONG", JSON.stringify({
         correlation_id: correlationId,
-        applicantId_local: shadowResult.applicantId_local,
+        duplicateDetectedUnderLock: !!prepResult.duplicate,
+        existingRow: prepResult.existingRow || 0,
+        applicantId_local: prepResult.applicantId_local || "",
         applicantId_downstream: parsed.ApplicantID,
-        incomingFolderUrl: shadowResult.incomingFolderUrl,
-        folderMode_local: shadowResult.folderMode_local
+        incomingFolderUrl: prepResult.incomingFolderUrl || "",
+        folderMode_local: prepResult.folderMode_local || "",
+        portalSecretsPrepared: !!(prepResult.tokenPlan && prepResult.tokenPlan.portalSecretsPrepared),
+        mappedHeaderCount: prepResult.mappedHeaderCount || 0
       }));
     }
     log_(logSheet, "FORWARD_OK", JSON.stringify({
@@ -318,6 +306,270 @@ function findExistingByFormId_(sheet, formId) {
   }
   return null;
 }
+
+function findExistingActivationByFormIdLocked_(sheet, formId) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+
+  const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+  const fdIdx = headers.indexOf("FD_FormID");
+  const formIdx = headers.indexOf("FormID");
+  if (fdIdx === -1 && formIdx === -1) return null;
+
+  const applicantIdx = headers.indexOf("ApplicantID");
+  const folderIdx = headers.indexOf("Folder_Url");
+  const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+
+  for (let i = values.length - 1; i >= 0; i--) {
+    const fdVal = fdIdx !== -1 ? String(values[i][fdIdx] || "").trim() : "";
+    const formVal = formIdx !== -1 ? String(values[i][formIdx] || "").trim() : "";
+    if (fdVal === formId || formVal === formId) {
+      return {
+        row: i + 2,
+        existingApplicantId: applicantIdx !== -1 ? String(values[i][applicantIdx] || "").trim() : "",
+        existingFolderUrl: folderIdx !== -1 ? String(values[i][folderIdx] || "").trim() : ""
+      };
+    }
+  }
+
+  return null;
+}
+
+function toHex_(bytes) {
+  return bytes.map(function(b) {
+    const v = (b + 256) % 256;
+    return ("0" + v.toString(16)).slice(-2);
+  }).join("");
+}
+
+function preparePortalSecretParity_(sheet, payload, ctx, applicantId) {
+  const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+  const hasPortalTokenHashHeader = headers.indexOf("PortalTokenHash") !== -1;
+  const hasPortalTokenIssuedAtHeader = headers.indexOf("PortalTokenIssuedAt") !== -1;
+  const formId = String(payload.FD_FormID || payload.FormID || "").trim();
+  const portalTokenIssuedAt = String(ctx.adapterTimestamp || new Date().toISOString());
+
+  if (!hasPortalTokenHashHeader && !hasPortalTokenIssuedAtHeader) {
+    return {
+      hasPortalTokenHashHeader,
+      hasPortalTokenIssuedAtHeader,
+      portalTokenHash: "",
+      portalTokenIssuedAt: "",
+      portalSecretsPrepared: false,
+      reason: "portal token headers absent"
+    };
+  }
+
+  if (!applicantId || !formId) {
+    return {
+      hasPortalTokenHashHeader,
+      hasPortalTokenIssuedAtHeader,
+      portalTokenHash: "",
+      portalTokenIssuedAt: portalTokenIssuedAt,
+      portalSecretsPrepared: false,
+      reason: "missing applicantId or formId for token parity prep"
+    };
+  }
+
+  const digestInput = [applicantId, formId, String(ctx.correlationId || ""), portalTokenIssuedAt].join("|");
+  const portalTokenHash = toHex_(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, digestInput));
+
+  return {
+    hasPortalTokenHashHeader,
+    hasPortalTokenIssuedAtHeader,
+    portalTokenHash: hasPortalTokenHashHeader ? portalTokenHash : "",
+    portalTokenIssuedAt: hasPortalTokenIssuedAtHeader ? portalTokenIssuedAt : "",
+    portalSecretsPrepared: hasPortalTokenHashHeader && hasPortalTokenIssuedAtHeader,
+    reason: hasPortalTokenHashHeader && hasPortalTokenIssuedAtHeader ? "" : "partial token headers present"
+  };
+}
+
+function buildExactActivationRowPlan_(sheet, payload, ctx) {
+  const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+  const intakeValue = String(payload["Intake Year"] || payload.Intake_Year || payload.IntakeYear || "").trim();
+  const desired = {
+    ApplicantID: String(ctx.applicantId || "").trim(),
+    FD_FormID: String(payload.FD_FormID || payload.FormID || "").trim(),
+    FormID: String(payload.FormID || payload.FD_FormID || "").trim(),
+    First_Name: String(payload.First_Name || "").trim(),
+    Last_Name: String(payload.Last_Name || "").trim(),
+    Grade_Applying_For: String(payload.Grade_Applying_For || "").trim(),
+    Parent_Email: String(payload.Parent_Email || "").trim(),
+    Parent_Phone: String(payload.Parent_Phone || "").trim(),
+    Province_Of_Birth: String(payload.Province_Of_Birth || "").trim(),
+    "Intake Year": intakeValue,
+    Intake_Year: intakeValue,
+    Folder_Url: String(ctx.folderUrl || (ctx.folder ? ctx.folder.getUrl() : "") || "").trim(),
+    CRM_Response: String(ctx.crmResponse || "").trim(),
+    Contact_ID: String(ctx.contactId || "").trim(),
+    Deal_ID: String(ctx.dealId || "").trim(),
+    adapter_forwarded: String(payload.adapter_forwarded || "1").trim(),
+    adapter_source: String(payload.adapter_source || "sheet_bound_adapter").trim(),
+    correlation_id: String(ctx.correlationId || payload.correlation_id || "").trim(),
+    adapter_timestamp: String(ctx.adapterTimestamp || payload.adapter_timestamp || "").trim(),
+    PortalTokenHash: String((ctx.tokenPlan && ctx.tokenPlan.portalTokenHash) || "").trim(),
+    PortalTokenIssuedAt: String((ctx.tokenPlan && ctx.tokenPlan.portalTokenIssuedAt) || "").trim()
+  };
+
+  const expectedHeaders = [
+    "ApplicantID",
+    "FD_FormID",
+    "FormID",
+    "Folder_Url",
+    "CRM_Response",
+    "Contact_ID",
+    "Deal_ID",
+    "adapter_forwarded",
+    "adapter_source",
+    "correlation_id",
+    "adapter_timestamp"
+  ];
+
+  if (headers.indexOf("Intake Year") !== -1) {
+    expectedHeaders.push("Intake Year");
+  } else if (headers.indexOf("Intake_Year") !== -1) {
+    expectedHeaders.push("Intake_Year");
+  } else {
+    expectedHeaders.push("Intake Year");
+  }
+
+  if (ctx.tokenPlan && ctx.tokenPlan.hasPortalTokenHashHeader) expectedHeaders.push("PortalTokenHash");
+  if (ctx.tokenPlan && ctx.tokenPlan.hasPortalTokenIssuedAtHeader) expectedHeaders.push("PortalTokenIssuedAt");
+
+  const rowFieldsPlanned = {};
+  let mappedHeaderCount = 0;
+
+  headers.forEach(function(header) {
+    let value = "";
+    if (Object.prototype.hasOwnProperty.call(desired, header)) {
+      value = desired[header];
+      if (expectedHeaders.indexOf(header) !== -1) mappedHeaderCount++;
+    } else if (Object.prototype.hasOwnProperty.call(payload, header)) {
+      value = normalize_(payload[header]);
+    }
+    rowFieldsPlanned[header] = value == null ? "" : String(value);
+  });
+
+  return {
+    rowFieldsPlanned: rowFieldsPlanned,
+    missingHeaders: expectedHeaders.filter(function(header) { return headers.indexOf(header) === -1; }),
+    mappedHeaderCount: mappedHeaderCount
+  };
+}
+
+function buildActivationVerificationPlan_(sheet, rowPlan, tokenPlan) {
+  const rowFields = rowPlan.rowFieldsPlanned || {};
+  const requiredNonBlankHeaders = [];
+
+  ["ApplicantID", "Folder_Url"].forEach(function(header) {
+    if (Object.prototype.hasOwnProperty.call(rowFields, header)) requiredNonBlankHeaders.push(header);
+  });
+
+  if (Object.prototype.hasOwnProperty.call(rowFields, "FD_FormID")) {
+    requiredNonBlankHeaders.push("FD_FormID");
+  } else if (Object.prototype.hasOwnProperty.call(rowFields, "FormID")) {
+    requiredNonBlankHeaders.push("FormID");
+  }
+
+  if (tokenPlan && tokenPlan.hasPortalTokenHashHeader) requiredNonBlankHeaders.push("PortalTokenHash");
+  if (tokenPlan && tokenPlan.hasPortalTokenIssuedAtHeader) requiredNonBlankHeaders.push("PortalTokenIssuedAt");
+
+  return {
+    requiredNonBlankHeaders: requiredNonBlankHeaders,
+    targetApplicantId: String(rowFields.ApplicantID || "").trim(),
+    targetFormId: String(rowFields.FD_FormID || rowFields.FormID || "").trim(),
+    tokenChecksRequired: {
+      portalTokenHashRequired: !!(tokenPlan && tokenPlan.hasPortalTokenHashHeader),
+      portalTokenIssuedAtRequired: !!(tokenPlan && tokenPlan.hasPortalTokenIssuedAtHeader)
+    },
+    folderRequired: true
+  };
+}
+
+function prepareLocalActivationLocked_(ss, payload, ctx) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    const sheet = mustGetSheet_(ss, CONFIG.DATA_SHEET);
+    const formId = String(payload.FD_FormID || payload.FormID || "").trim();
+    const duplicateHit = formId ? findExistingActivationByFormIdLocked_(sheet, formId) : null;
+
+    if (duplicateHit) {
+      const duplicateApplicantId = String(duplicateHit.existingApplicantId || "").trim();
+      const tokenPlanDup = preparePortalSecretParity_(sheet, payload, ctx, duplicateApplicantId);
+      const rowPlanDup = buildExactActivationRowPlan_(sheet, payload, {
+        correlationId: ctx.correlationId,
+        folder: ctx.folder,
+        folderUrl: duplicateHit.existingFolderUrl || ctx.folderUrl,
+        crmResponse: ctx.crmResponse,
+        contactId: ctx.contactId,
+        dealId: ctx.dealId,
+        adapterTimestamp: ctx.adapterTimestamp,
+        applicantId: duplicateApplicantId,
+        tokenPlan: tokenPlanDup
+      });
+      const verificationPlanDup = buildActivationVerificationPlan_(sheet, rowPlanDup, tokenPlanDup);
+
+      return {
+        correlation_id: ctx.correlationId,
+        duplicate: true,
+        existingRow: duplicateHit.row,
+        existingApplicantId: duplicateApplicantId,
+        existingFolderUrl: duplicateHit.existingFolderUrl || "",
+        applicantId_local: duplicateApplicantId,
+        applicantIdStats: null,
+        incomingFolderUrl: String(ctx.folderUrl || "").trim(),
+        folderMode_local: (duplicateHit.existingFolderUrl || ctx.folderUrl) ? "trust_incoming_for_now" : "would_create_new",
+        tokenPlan: tokenPlanDup,
+        rowFieldsPlanned: rowPlanDup.rowFieldsPlanned,
+        missingHeaders: rowPlanDup.missingHeaders,
+        mappedHeaderCount: rowPlanDup.mappedHeaderCount,
+        verificationPlan: verificationPlanDup
+      };
+    }
+
+    const sim = simulateNextApplicantId_(sheet);
+    const tokenPlan = preparePortalSecretParity_(sheet, payload, ctx, sim.applicantId);
+    const rowPlan = buildExactActivationRowPlan_(sheet, payload, {
+      correlationId: ctx.correlationId,
+      folder: ctx.folder,
+      folderUrl: ctx.folderUrl,
+      crmResponse: ctx.crmResponse,
+      contactId: ctx.contactId,
+      dealId: ctx.dealId,
+      adapterTimestamp: ctx.adapterTimestamp,
+      applicantId: sim.applicantId,
+      tokenPlan: tokenPlan
+    });
+    const verificationPlan = buildActivationVerificationPlan_(sheet, rowPlan, tokenPlan);
+
+    return {
+      correlation_id: ctx.correlationId,
+      duplicate: false,
+      existingRow: 0,
+      existingApplicantId: "",
+      existingFolderUrl: "",
+      applicantId_local: sim.applicantId,
+      applicantIdStats: {
+        validCount: sim.validCount,
+        maxSuffix: sim.maxSuffix,
+        skippedBlankCount: sim.skippedBlankCount,
+        skippedMalformedCount: sim.skippedMalformedCount
+      },
+      incomingFolderUrl: String(ctx.folderUrl || "").trim(),
+      folderMode_local: ctx.folderUrl ? "trust_incoming_for_now" : "would_create_new",
+      tokenPlan: tokenPlan,
+      rowFieldsPlanned: rowPlan.rowFieldsPlanned,
+      missingHeaders: rowPlan.missingHeaders,
+      mappedHeaderCount: rowPlan.mappedHeaderCount,
+      verificationPlan: verificationPlan
+    };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 
 function simulateNextApplicantId_(sheet) {
   const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
