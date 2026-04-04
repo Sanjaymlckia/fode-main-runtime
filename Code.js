@@ -18,7 +18,7 @@ const CONFIG = {
   DEAL_STAGE: "New To MLCKIA",
 
   DEAL_DUPLICATE_FIELD: "FormID",
-  VERSION: "r254B",
+  VERSION: "r254C2",
   DEPLOY_VERSION_NUMBER: 254,
   PROJECT: "FODE_Main_Runtime"
 };
@@ -155,8 +155,57 @@ function doPost(e) {
 
   let responseCode = 0;
   let responseText = "";
+  let shadowResult = null;
+
+  const shadowSheet = mustGetSheet_(ss, CONFIG.DATA_SHEET);
+
+    try {
+      const sim = simulateNextApplicantId_(shadowSheet);
+      const prereq = buildShadowPrereqPlan_(shadowSheet, folderUrl);
+      const rowPlan = buildShadowRowPlan_(forwarded, {
+        correlationId,
+        folderUrl,
+        crmResponse,
+        contactId,
+        dealId,
+        adapterTimestamp
+      });
+
+      shadowResult = {
+        correlation_id: correlationId,
+        applicantId_local: sim.applicantId,
+        applicantIdStats: {
+          validCount: sim.validCount,
+          maxSuffix: sim.maxSuffix,
+          skippedBlankCount: sim.skippedBlankCount,
+          skippedMalformedCount: sim.skippedMalformedCount
+        },
+        incomingFolderUrl: prereq.incomingFolderUrl,
+        folderMode_local: prereq.folderMode_local,
+        tokenFieldsPlanned: prereq.tokenFieldsPlanned,
+        rowFieldsPlanned: rowPlan,
+        verificationChecksPlanned: prereq.verificationChecksPlanned
+      };
+
+      log_(logSheet, "SHADOW_ACTIVATION_RESULT", JSON.stringify(shadowResult));
+    } catch (err) {
+      log_(logSheet, "SHADOW_ACTIVATION_ERROR", JSON.stringify({
+        correlation_id: correlationId,
+        error: err.message
+      }));
+    }
 
   try {
+    log_(logSheet, "FORWARD_PAYLOAD_TRACE", JSON.stringify({
+      correlation_id: correlationId,
+      fd_form_id: fdFormId,
+      keys: Object.keys(forwarded || {}),
+      hasFolderUrl: !!forwarded.Folder_Url,
+      hasCRM: !!forwarded.CRM_Response,
+      hasContact: !!forwarded.Contact_ID,
+      hasDeal: !!forwarded.Deal_ID
+    }));
+
     const resp = UrlFetchApp.fetch(mainUrl, {
       method: "post",
       contentType: "application/json",
@@ -169,15 +218,43 @@ function doPost(e) {
 
     let parsed = null;
     try { parsed = JSON.parse(responseText); } catch {}
+    log_(logSheet, "FORWARD_RESPONSE_TRACE", JSON.stringify({
+      correlation_id: correlationId,
+      responseCode: responseCode,
+      hasParsed: !!parsed,
+      status: parsed ? parsed.status : "",
+      applicantId: parsed ? parsed.ApplicantID : "",
+      rawLength: (responseText || "").length
+    }));
+
 
     const ok = responseCode === 200 && parsed && parsed.status === "ok";
 
     if (!ok) {
+      log_(logSheet, "FORWARD_ERROR_TRACE", JSON.stringify({
+        correlation_id: correlationId,
+        responseCode: responseCode,
+        responseText: (responseText || "").slice(0, 1000)
+      }));
       log_(logSheet, "FORWARD_FAIL", responseText);
       return ContentService.createTextOutput(JSON.stringify({ status: "error" }))
         .setMimeType(ContentService.MimeType.JSON);
     }
 
+    log_(logSheet, "FORWARD_SUCCESS_TRACE", JSON.stringify({
+      correlation_id: correlationId,
+      fd_form_id: fdFormId,
+      applicantId: parsed ? parsed.ApplicantID : ""
+    }));
+    if (shadowResult && parsed && parsed.ApplicantID) {
+      log_(logSheet, "PARITY_COMPARE", JSON.stringify({
+        correlation_id: correlationId,
+        applicantId_local: shadowResult.applicantId_local,
+        applicantId_downstream: parsed.ApplicantID,
+        incomingFolderUrl: shadowResult.incomingFolderUrl,
+        folderMode_local: shadowResult.folderMode_local
+      }));
+    }
     log_(logSheet, "FORWARD_OK", JSON.stringify({
       correlation_id: correlationId,
       fd_form_id: fdFormId
@@ -189,6 +266,10 @@ function doPost(e) {
     })).setMimeType(ContentService.MimeType.JSON);
 
   } catch (err) {
+    log_(logSheet, "FORWARD_EXCEPTION_TRACE", JSON.stringify({
+      correlation_id: correlationId,
+      error: err.message
+    }));
     log_(logSheet, "FORWARD_FAIL", err.message);
     return ContentService.createTextOutput(JSON.stringify({ status: "error" }))
       .setMimeType(ContentService.MimeType.JSON);
@@ -236,6 +317,44 @@ function findExistingByFormId_(sheet, formId) {
     }
   }
   return null;
+}
+
+function simulateNextApplicantId_(sheet) {
+  const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+  const idx = headers.indexOf("ApplicantID");
+  if (idx === -1) throw new Error("ApplicantID column missing");
+
+  const lastRow = sheet.getLastRow();
+  const yy = String(new Date().getFullYear()).slice(-2);
+  if (lastRow < 2) {
+    return {
+      applicantId: "FODE-" + yy + "-000001",
+      validCount: 0,
+      maxSuffix: 0,
+      skippedBlankCount: 0,
+      skippedMalformedCount: 0
+    };
+  }
+
+  const values = sheet.getRange(2, idx + 1, lastRow - 1, 1).getValues();
+  let validCount = 0, maxSuffix = 0, skippedBlankCount = 0, skippedMalformedCount = 0;
+
+  for (let i = 0; i < values.length; i++) {
+    const v = String(values[i][0] || "").trim();
+    if (!v) { skippedBlankCount++; continue; }
+    const m = v.match(/^([A-Z]+-\d{2}-)(\d+)$/);
+    if (!m) { skippedMalformedCount++; continue; }
+    validCount++;
+    maxSuffix = Math.max(maxSuffix, parseInt(m[2], 10));
+  }
+
+  return {
+    applicantId: "FODE-" + yy + "-" + String(maxSuffix + 1).padStart(6, "0"),
+    validCount,
+    maxSuffix,
+    skippedBlankCount,
+    skippedMalformedCount
+  };
 }
 
 function nextApplicantIdLocked_(sheet) {
@@ -401,6 +520,50 @@ function upsertZohoDeal_(token, payload, folder, contactId) {
 }
 
 /******************** UTIL ********************/
+function buildShadowRowPlan_(payload, ctx) {
+  return {
+    FD_FormID: String(payload.FD_FormID || payload.FormID || "").trim(),
+    FormID: String(payload.FormID || payload.FD_FormID || "").trim(),
+    First_Name: String(payload.First_Name || "").trim(),
+    Last_Name: String(payload.Last_Name || "").trim(),
+    Grade_Applying_For: String(payload.Grade_Applying_For || "").trim(),
+    Parent_Email: String(payload.Parent_Email || "").trim(),
+    Parent_Phone: String(payload.Parent_Phone || "").trim(),
+    Province_Of_Birth: String(payload.Province_Of_Birth || "").trim(),
+    Intake_Year: String(payload["Intake Year"] || payload.Intake_Year || payload.IntakeYear || "").trim(),
+    Folder_Url: String(ctx.folderUrl || "").trim(),
+    CRM_Response_Present: !!ctx.crmResponse,
+    Contact_ID: String(ctx.contactId || "").trim(),
+    Deal_ID: String(ctx.dealId || "").trim(),
+    adapter_forwarded: "1",
+    adapter_source: "sheet_bound_adapter",
+    correlation_id: String(ctx.correlationId || "").trim(),
+    adapter_timestamp: String(ctx.adapterTimestamp || "").trim()
+  };
+}
+
+function buildShadowPrereqPlan_(sheet, incomingFolderUrl) {
+  const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+  const hasPortalTokenHashHeader = headers.indexOf("PortalTokenHash") !== -1;
+  const hasPortalTokenIssuedAtHeader = headers.indexOf("PortalTokenIssuedAt") !== -1;
+
+  return {
+    incomingFolderUrl: incomingFolderUrl || "",
+    folderMode_local: incomingFolderUrl ? "trust_incoming_for_now" : "would_create_new",
+    tokenFieldsPlanned: {
+      hasPortalTokenHashHeader,
+      hasPortalTokenIssuedAtHeader,
+      wouldNeedPortalSecretPreparation: hasPortalTokenHashHeader && hasPortalTokenIssuedAtHeader
+    },
+    verificationChecksPlanned: [
+      "ApplicantID persisted",
+      "Folder_Url present",
+      "PortalTokenHash present if header exists",
+      "PortalTokenIssuedAt present if header exists"
+    ]
+  };
+}
+
 function mustGetSheet_(ss, name) {
   const sh = ss.getSheetByName(name);
   if (!sh) throw new Error("Missing sheet: " + name);
@@ -433,4 +596,7 @@ function payloadSummary_(p) {
     Intake: p["Intake Year"] || ""
   });
 }
+
+
+
 
