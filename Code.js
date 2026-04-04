@@ -18,7 +18,7 @@ const CONFIG = {
   DEAL_STAGE: "New To MLCKIA",
 
   DEAL_DUPLICATE_FIELD: "FormID",
-  VERSION: "r254C3d",
+  VERSION: "r254C3e",
   LOCAL_ACTIVATION_ENABLED: false,
   LOCAL_COMMIT_ENABLED: false,
   DEPLOY_VERSION_NUMBER: 254,
@@ -419,8 +419,8 @@ function preparePortalSecretParity_(sheet, payload, ctx, applicantId) {
   const hasPortalTokenHashHeader = headers.indexOf("PortalTokenHash") !== -1;
   const hasPortalTokenIssuedAtHeader = headers.indexOf("PortalTokenIssuedAt") !== -1;
   const formId = String(payload.FD_FormID || payload.FormID || "").trim();
-  const portalTokenIssuedAt = String(ctx.adapterTimestamp || new Date().toISOString());
-  const tokenDerivationBasis = "applicantId|formId|correlationId|adapterTimestamp";
+  const portalTokenIssuedAt = new Date().toString();
+  const tokenDerivationBasis = "applicantId|formId|issuedAt";
 
   if (!hasPortalTokenHashHeader && !hasPortalTokenIssuedAtHeader) {
     return {
@@ -429,7 +429,7 @@ function preparePortalSecretParity_(sheet, payload, ctx, applicantId) {
       portalTokenHash: "",
       portalTokenIssuedAt: "",
       portalSecretsPrepared: false,
-      tokenSource: "local_parity_prep_current_assumption",
+      tokenSource: "local_parity_prep_issuedAt_hypothesis",
       tokenDerivationBasis: tokenDerivationBasis,
       reason: "portal token headers absent"
     };
@@ -442,13 +442,13 @@ function preparePortalSecretParity_(sheet, payload, ctx, applicantId) {
       portalTokenHash: "",
       portalTokenIssuedAt: portalTokenIssuedAt,
       portalSecretsPrepared: false,
-      tokenSource: "local_parity_prep_current_assumption",
+      tokenSource: "local_parity_prep_issuedAt_hypothesis",
       tokenDerivationBasis: tokenDerivationBasis,
       reason: "missing applicantId or formId for token parity prep"
     };
   }
 
-  const digestInput = [applicantId, formId, String(ctx.correlationId || ""), portalTokenIssuedAt].join("|");
+  const digestInput = [applicantId, formId, portalTokenIssuedAt].join("|");
   const portalTokenHash = toHex_(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, digestInput));
 
   return {
@@ -457,7 +457,7 @@ function preparePortalSecretParity_(sheet, payload, ctx, applicantId) {
     portalTokenHash: hasPortalTokenHashHeader ? portalTokenHash : "",
     portalTokenIssuedAt: hasPortalTokenIssuedAtHeader ? portalTokenIssuedAt : "",
     portalSecretsPrepared: hasPortalTokenHashHeader && hasPortalTokenIssuedAtHeader,
-    tokenSource: "local_parity_prep_current_assumption",
+    tokenSource: "local_parity_prep_issuedAt_hypothesis",
     tokenDerivationBasis: tokenDerivationBasis,
     reason: hasPortalTokenHashHeader && hasPortalTokenIssuedAtHeader ? "" : "partial token headers present"
   };
@@ -1060,6 +1060,7 @@ function payloadSummary_(p) {
     Intake: p["Intake Year"] || ""
   });
 }
+
 
 
 
