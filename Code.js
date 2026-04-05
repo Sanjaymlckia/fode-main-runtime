@@ -18,24 +18,121 @@ const CONFIG = {
   DEAL_STAGE: "New To MLCKIA",
 
   DEAL_DUPLICATE_FIELD: "FormID",
-  VERSION: "r254C3g",
+  VERSION: "r254C3h",
   LOCAL_ACTIVATION_ENABLED: false,
   LOCAL_COMMIT_ENABLED: false,
   DEPLOY_VERSION_NUMBER: 254,
-  PROJECT: "FODE_Main_Runtime"
+  PROJECT: "FODE_Main_Runtime",
+  UPSTREAM_DEPLOYMENT_ID: "AKfycbxIypaJJSyqipbQU3IkcYkpWVBo4v3SlNeCLnrhOHUBt3DOZsAk5p0QosEkp2T5MZ-6fw",
+  DOWNSTREAM_RUNTIME_DEPLOYMENT_ID: "AKfycbwLz4rLrVzk-NriJAovTbifpg8YpQguFJiY-l02qkRrahH1ayX_2qBh3bk_rc8dVnPp"
 };
+
+function canonicalExecBaseForDeployment_(deploymentId) {
+  const id = String(deploymentId || "").trim();
+  return id ? "https://script.google.com/macros/s/" + id + "/exec" : "";
+}
 
 function canonicalExecBase_() {
   const raw = String(ScriptApp.getService().getUrl() || "").trim();
   const m = raw.match(/\/macros\/s\/([a-zA-Z0-9\-_]+)\/exec/);
   return m
-    ? "https://script.google.com/macros/s/" + m[1] + "/exec"
-    : raw;
+    ? canonicalExecBaseForDeployment_(m[1])
+    : canonicalExecBaseForDeployment_(CONFIG.UPSTREAM_DEPLOYMENT_ID);
+}
+
+function pickCanonicalRouteParams_(params) {
+  const picked = {};
+  ["view", "id", "s", "action", "route"].forEach(function(key) {
+    const value = String((params && params[key]) || "").trim();
+    if (value) picked[key] = value;
+  });
+  return picked;
+}
+
+function buildCanonicalTarget_(base, params) {
+  const query = Object.keys(params || {}).map(function(key) {
+    return encodeURIComponent(key) + "=" + encodeURIComponent(String(params[key] || ""));
+  }).join("&");
+  return query ? base + "?" + query : base;
+}
+
+function escapeHtml_(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function createCanonicalRedirectOutput_(targetUrl, title) {
+  const safeTitle = escapeHtml_(title || "Redirecting");
+  const safeTarget = String(targetUrl || "");
+  const html = [
+    "<!doctype html>",
+    "<html><head>",
+    "<meta charset=\"utf-8\">",
+    "<meta http-equiv=\"Cache-Control\" content=\"no-store, no-cache, must-revalidate, max-age=0\">",
+    "<meta http-equiv=\"Pragma\" content=\"no-cache\">",
+    "<meta http-equiv=\"Expires\" content=\"0\">",
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+    "<title>" + safeTitle + "</title>",
+    "</head><body>",
+    "<p>" + safeTitle + "</p>",
+    "<script>",
+    "window.location.replace(" + JSON.stringify(safeTarget) + ");",
+    "</script>",
+    "<noscript><meta http-equiv=\"refresh\" content=\"0; url=" + escapeHtml_(safeTarget) + "\"></noscript>",
+    "</body></html>"
+  ].join("");
+  return HtmlService.createHtmlOutput(html)
+    .setTitle(safeTitle)
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function logEntryRoute_(label, details) {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+    const logSheet = mustGetSheet_(ss, CONFIG.LOG_SHEET);
+    log_(logSheet, label, JSON.stringify(details || {}));
+  } catch (err) {
+    console.error(label + ": " + err.message);
+  }
 }
 
 function doGet(e) {
-  const view = String((e && e.parameter && e.parameter.view) || "").trim().toLowerCase();
+  const params = (e && e.parameter) || {};
+  const view = String(params.view || "").trim().toLowerCase();
   const base = canonicalExecBase_();
+  const routeParams = pickCanonicalRouteParams_(params);
+  const isTokenEntry = !!(routeParams.id && routeParams.s);
+
+  if (view === "admin") {
+    const target = buildCanonicalTarget_(
+      canonicalExecBaseForDeployment_(CONFIG.DOWNSTREAM_RUNTIME_DEPLOYMENT_ID),
+      Object.assign({}, routeParams, { view: "admin" })
+    );
+    logEntryRoute_("ADMIN_ENTRY_ROUTE", {
+      incoming_view: view,
+      incoming_params: routeParams,
+      target: target
+    });
+    return createCanonicalRedirectOutput_(target, "Redirecting to admin");
+  }
+
+  if (isTokenEntry) {
+    const target = buildCanonicalTarget_(
+      canonicalExecBaseForDeployment_(CONFIG.DOWNSTREAM_RUNTIME_DEPLOYMENT_ID),
+      routeParams
+    );
+    logEntryRoute_("STUDENT_ENTRY_ROUTE", {
+      incoming_view: view,
+      applicant_id: String(routeParams.id || ""),
+      has_secret: !!routeParams.s,
+      target: target
+    });
+    return createCanonicalRedirectOutput_(target, "Redirecting to portal");
+  }
 
   const body = view === "whoami"
     ? {
@@ -1254,12 +1351,3 @@ function payloadSummary_(p) {
     Intake: p["Intake Year"] || ""
   });
 }
-
-
-
-
-
-
-
-
-
